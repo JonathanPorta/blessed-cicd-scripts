@@ -1,0 +1,127 @@
+# attest-export.yml — for the PUBLIC mirror repo that receives blessed-cicd's
+# public script exports (scripts/catalog.yml `exports:`; blessed-cicd#207).
+# Copy to <mirror>/.github/workflows/attest-export.yml unchanged, and copy the
+# export trust store (blessed-cicd scripts/exports/trust-store.json) to
+# <mirror>/.github/export-trust-store.json.
+#
+# What this workflow does and does NOT establish:
+#   * Before attesting, it verifies MANIFEST.sha256.sig over MANIFEST.sha256
+#     against the ed25519 key pinned in this repository's trust store, and that
+#     the tarball, MANIFEST.sha256 and SOURCE.json agree with each other: the
+#     closed set of blessed-cicd scripts/INSTALL.md (only the listed regular
+#     files and the directories they imply; no link, hard link, fifo, socket,
+#     device, unlisted file or unaccounted directory) and every hash. An export
+#     whose signature does not verify is never attested.
+#   * The attestation (actions/attest-build-provenance) then records that THIS
+#     mirror's workflow, at this commit, processed these exact bytes after the
+#     release was published. That is all it proves. It does NOT authenticate
+#     where the bytes were built or what SOURCE.json claims about the private
+#     source; the export signature, checked by a consumer against a key pinned
+#     out of band, is the origin evidence. The attestation is a convenience
+#     layer for consumers that already use `gh attestation verify`.
+name: 🔏 Attest public script export
+
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+concurrency:
+  group: attest-export-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  attest:
+    name: 🔏 Verify signature + consistency, then attest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: 📥 Checkout (the pinned trust store only)
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/export-trust-store.json
+          sparse-checkout-cone-mode: false
+
+      - name: ✅ Download, verify the export signature, and cross-check the assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$TAG" | grep -qxE '[a-z0-9][a-z0-9_-]*-v[0-9]+\.[0-9]+\.[0-9]+' ||
+            { echo "::error::not an export tag: $TAG"; exit 1; }
+          name="${TAG%-v*}"
+          store="$GITHUB_WORKSPACE/.github/export-trust-store.json"
+          mkdir -p export && cd export
+          gh release download "$TAG" -R "$REPO" -p "$TAG.tar.gz" -p MANIFEST.sha256 -p MANIFEST.sha256.sig -p SOURCE.json
+          jq -e --arg tag "$TAG" --arg name "$name" \
+            '.schema == "blessed/script-export-source/v1" and .tag == $tag and .export == $name
+             and .signing.profile == "ed25519-detached-v1"' SOURCE.json >/dev/null ||
+            { echo "::error::SOURCE.json does not describe $TAG"; exit 1; }
+          # The key comes from THIS repository's pinned trust store; SOURCE.json
+          # only names which pinned key to use.
+          kid="$(jq -r '.signing.key_id' SOURCE.json)"
+          pub="$(jq -r --arg k "$kid" '.keys[$k] | select(.status == "active" and .profile == "ed25519-detached-v1") | .public_key_base64' "$store")"
+          printf '%s' "$pub" | grep -qxE '[A-Za-z0-9+/]{43}=' || { echo "::error::$kid is not an active pinned key"; exit 1; }
+          printf -- '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA%s\n-----END PUBLIC KEY-----\n' "$pub" >"$RUNNER_TEMP/pub.pem"
+          openssl base64 -d -A <MANIFEST.sha256.sig >"$RUNNER_TEMP/sig.raw"
+          openssl pkeyutl -verify -pubin -inkey "$RUNNER_TEMP/pub.pem" -rawin \
+            -sigfile "$RUNNER_TEMP/sig.raw" -in MANIFEST.sha256 >/dev/null ||
+            { echo "::error::MANIFEST.sha256.sig does not verify with pinned key $kid"; exit 1; }
+          # Closed set (the same contract as the consumer install in blessed-cicd
+          # scripts/INSTALL.md): the tarball must hold exactly the signed
+          # manifest's entries, i.e. the regular files it lists (with their
+          # digests) and the directories those imply. Nothing else: no symlink,
+          # hard link, fifo, socket or device, no unlisted file, and no
+          # unaccounted directory, empty or not.
+          refuse() { echo "::error::$*"; exit 1; }
+          tgz="$TAG.tar.gz"
+          # a. The signed manifest: "<sha256>  <plain relative path>" lines only.
+          if grep -Evxq '[0-9a-f]{64}  [A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*' MANIFEST.sha256; then
+            refuse "MANIFEST.sha256 has a line that is not '<sha256>  <relative path>'"
+          fi
+          listed="$(cut -c67- MANIFEST.sha256 | LC_ALL=C sort)"
+          if grep -Eq '(^|/)\.\.?(/|$)' <<<"$listed"; then refuse "MANIFEST.sha256 lists a '.' or '..' path"; fi
+          [ -z "$(uniq -d <<<"$listed")" ] || refuse "MANIFEST.sha256 lists a path twice"
+          # want: every entry the export may hold, typed (f = regular file, d = directory).
+          want="$({
+            printf 'd %s\nf %s/MANIFEST.sha256\n' "$name" "$name"
+            awk -v e="$name" '{ print "f " e "/" $0; p = e; n = split($0, s, "/"); for (i = 1; i < n; i++) { p = p "/" s[i]; print "d " p } }' <<<"$listed"
+          } | LC_ALL=C sort -u)"
+          # b. The archive listing, before extracting: no link or special entry
+          #    (tar -tv type column is '-' or 'd'), and every name is a wanted
+          #    entry, so no absolute, '..' or outside path.
+          types="$(tar -tvzf "$tgz")"
+          names="$(tar -tzf "$tgz")"
+          [ "$(wc -l <<<"$types")" -eq "$(wc -l <<<"$names")" ] || refuse "the archive listing is ambiguous"
+          if grep -vq '^[-d]' <<<"$types"; then refuse "archive entry is a link or special file: $(grep -v '^[-d]' <<<"$types" | head -n 1)"; fi
+          while IFS= read -r n; do
+            grep -Fxq -e "d ${n%/}" -e "f $n" <<<"$want" || refuse "archive entry is not in the signed manifest: $n"
+          done <<<"$names"
+          # c. Extract into a fresh staging directory, then prove the staged tree
+          #    (find never follows links) is exactly the wanted set, typed, and
+          #    that every digest matches.
+          stage="$(mktemp -d "$RUNNER_TEMP/stage.XXXXXX")"
+          tar -xzf "$tgz" -C "$stage"
+          odd="$(cd "$stage" && find . -mindepth 1 ! -type d ! \( -type f -links 1 \))"
+          [ -z "$odd" ] || refuse "staged entry is a link, hard link or special file: $odd"
+          found="$(cd "$stage" && { find . -mindepth 1 -type d | sed 's#^\./#d #'; find . -type f | sed 's#^\./#f #'; } | LC_ALL=C sort)"
+          [ "$found" = "$want" ] || refuse "staged tree is not exactly the signed set: $(diff <(printf '%s\n' "$want") <(printf '%s\n' "$found") | grep '^[<>]' | tr '\n' ' ')"
+          cmp MANIFEST.sha256 "$stage/$name/MANIFEST.sha256"
+          cmp SOURCE.json "$stage/$name/SOURCE.json"
+          (cd "$stage/$name" && sha256sum -c --strict --quiet MANIFEST.sha256) || refuse "a file does not match its signed digest"
+
+      - name: 🔏 Attest (this mirror's workflow processed these bytes)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            export/${{ github.event.release.tag_name }}.tar.gz
+            export/MANIFEST.sha256
+            export/MANIFEST.sha256.sig
+            export/SOURCE.json
